@@ -2,9 +2,11 @@ package Economic_enitity;
 
 import java.util.concurrent.ThreadLocalRandom;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 
 import Main.Education2;
 import Market.ProductType;
+import Market.Market;
 import job.Job;
 import job.Jobskill;
 
@@ -51,12 +53,18 @@ public class Citizen implements Economic_Entity {
     public BigDecimal money_income = BigDecimal.ZERO;
     BigDecimal money_income_tax = BigDecimal.ZERO;
     private BigDecimal money_balance = BigDecimal.ZERO;
+    private BigDecimal savings = BigDecimal.ZERO; // separate savings/investment pool
     Company[] money_companies_owned = new Company[10]; 
     float[] money_companies_owned_share = new float[10];
     int age; 
 
     // --- NEW: Personal inventory using ProductType ---
     public final Map<ProductType, BigDecimal> personalInventory = new HashMap<>();
+
+    // Survival / wellbeing
+    public int monthsWithoutFood = 0;
+    public int happiness = 50; // 0..100
+    public boolean alive = true;
 
     // Default constructor for birth (used by zeugeKind)
     public Citizen() {
@@ -73,7 +81,7 @@ public class Citizen implements Economic_Entity {
         this.age = age2;
     }
 
-    // --- ORIGINAL REPRODUCTION LOGIC (SEX) ---
+    // --- REPRODUCTION LOGIC (unchanged) ---
     public static Citizen zeugeKind(Citizen vater, Citizen mutter, String nameDesKindes) {
         Citizen kind = new Citizen();
         kind.id = nameDesKindes;
@@ -226,8 +234,161 @@ public class Citizen implements Economic_Entity {
         return personalInventory.getOrDefault(type, BigDecimal.ZERO).compareTo(tradeAmount) >= 0;
     }
 
+    /**
+     * Decision and consumption function that determines whether a citizen consumes, buys, invests or saves.
+     * - Considers financial state, genetic/economic skill (skill_wirtschaftliches_denken), experience_finance and happiness.
+     * - Tries to satisfy essential needs first (food, water, hygiene, medicine). If essentials cannot be met for
+     *   a configurable number of months the citizen dies (alive=false).
+     * - Places buy orders on the market for shortfalls up to what the citizen can afford at the cheapest market price.
+     * - Allocates a fraction of remaining balance to savings/investment depending on propensity determined by skills and happiness.
+     * - Adjusts happiness up/down (boni/mali) based on whether needs were met.
+     *
+     * @param market Market instance used to read prices and place buy orders (may be null, in which case no market purchases happen)
+     * @return true if the citizen is still alive after the decision, false if starved to death
+     */
+    public boolean decideConsumeOrInvest(Market market) {
+        if (!alive) return false;
 
-    
+        // Essential needs profile (monthly). Values can be tuned or moved to config.
+        Map<ProductType, BigDecimal> essentials = new HashMap<>();
+        essentials.put(ProductType.Water, BigDecimal.valueOf(10));
+        essentials.put(ProductType.Wheat, BigDecimal.valueOf(3));
+        essentials.put(ProductType.Milk, BigDecimal.valueOf(1));
+        essentials.put(ProductType.Eggs, BigDecimal.valueOf(4));
+        essentials.put(ProductType.Soap, BigDecimal.valueOf(0.5));
+        essentials.put(ProductType.Medicine, BigDecimal.valueOf(0.1));
+        essentials.put(ProductType.Clothing, BigDecimal.valueOf(0.02)); // durable, rarely consumed
+
+        // Parameters
+        final int MONTHS_TO_STARVE = 2;
+        final BigDecimal MIN_BALANCE_BUFFER = BigDecimal.valueOf(5); // keep a tiny buffer
+
+        // Compute disposable funds this month (balance + income) but leave a buffer
+        BigDecimal disposable = getMoney_balance().add(money_income).subtract(MIN_BALANCE_BUFFER);
+        if (disposable.compareTo(BigDecimal.ZERO) < 0) disposable = BigDecimal.ZERO;
+
+        // Determine investment propensity from economics skill, finance experience and happiness
+        double skillFactor = (this.skill_wirtschaftliches_denken / 100.0); // 0..1
+        double financeExpFactor = (this.experience_finance / 10.0); // scaled
+        double happinessFactor = ((this.happiness - 50) / 100.0); // -0.5 .. +0.5
+
+        double basePropensity = 0.05; // base fraction to invest/save
+        double propensity = basePropensity + skillFactor * 0.25 + financeExpFactor * 0.1 + happinessFactor * 0.05;
+        // clamp
+        if (propensity < 0.0) propensity = 0.0;
+        if (propensity > 0.8) propensity = 0.8;
+
+        // Track whether critical food needs met
+        boolean criticalShortfall = false;
+
+        // 1) Satisfy essentials
+        for (Map.Entry<ProductType, BigDecimal> need : essentials.entrySet()) {
+            ProductType type = need.getKey();
+            BigDecimal required = need.getValue();
+            if (required.compareTo(BigDecimal.ZERO) <= 0) continue;
+
+            BigDecimal have = personalInventory.getOrDefault(type, BigDecimal.ZERO);
+            BigDecimal toConsume = have.min(required);
+
+            if (toConsume.compareTo(BigDecimal.ZERO) > 0) {
+                removeProduct(type, toConsume);
+                required = required.subtract(toConsume);
+                // small happiness bonus for consuming
+                this.happiness = Math.min(100, this.happiness + 1);
+            }
+
+            if (required.compareTo(BigDecimal.ZERO) > 0) {
+                // Need to buy some amount
+                if (market != null) {
+                    BigDecimal cheapest = market.getCheapestPrice(type);
+                    if (cheapest != null && cheapest.compareTo(BigDecimal.ZERO) > 0) {
+                        // affordable units
+                        BigDecimal affordable = BigDecimal.ZERO;
+                        if (disposable.compareTo(cheapest) >= 0) {
+                            affordable = disposable.divide(cheapest, 0, RoundingMode.FLOOR);
+                        }
+                        BigDecimal toBuy = affordable.min(required);
+                        if (toBuy.compareTo(BigDecimal.ZERO) > 0) {
+                            market.placeOrder(this, type, cheapest, toBuy, true);
+                            // reserve money for purchase (optimistic; actual deduction happens on match)
+                            BigDecimal reserved = toBuy.multiply(cheapest);
+                            disposable = disposable.subtract(reserved);
+                            // count as expected consumption
+                            required = required.subtract(toBuy);
+                            // planned consumption gives small happiness
+                            this.happiness = Math.min(100, this.happiness + 1);
+                        }
+                    }
+                }
+            }
+
+            // If still short after attempting to buy
+            if (required.compareTo(BigDecimal.ZERO) > 0) {
+                // apply malus depending on type (food/water more severe)
+                if (type == ProductType.Water || type == ProductType.Wheat || type == ProductType.Milk || type == ProductType.Eggs || type == ProductType.Beef || type == ProductType.Pork || type == ProductType.Chicken_Meat) {
+                    // critical food shortfall
+                    this.happiness = Math.max(0, this.happiness - 20);
+                    this.monthsWithoutFood++;
+                    criticalShortfall = true;
+                } else {
+                    // less critical
+                    this.happiness = Math.max(0, this.happiness - 5);
+                }
+            }
+        }
+
+        // If critical shortfalls persisted for too long, citizen dies
+        if (this.monthsWithoutFood >= MONTHS_TO_STARVE) {
+            this.alive = false;
+            System.out.println("[Citizen] " + getName() + " has starved to death.");
+            return false;
+        }
+
+        // Successful month resets starvation counter
+        if (!criticalShortfall) this.monthsWithoutFood = 0;
+
+        // 2) After essentials satisfied (or attempted), allocate remaining disposable to savings/investment or discretionary consumption
+        // Recompute disposable from current balance (note some money may be reserved by placed buy orders but not deducted yet)
+        BigDecimal currentDisposable = getMoney_balance().add(money_income).subtract(MIN_BALANCE_BUFFER);
+        if (currentDisposable.compareTo(BigDecimal.ZERO) < 0) currentDisposable = BigDecimal.ZERO;
+
+        BigDecimal investAmount = BigDecimal.valueOf(propensity).multiply(currentDisposable).setScale(2, RoundingMode.FLOOR);
+        if (investAmount.compareTo(BigDecimal.ZERO) > 0) {
+            // Move to savings (representing investment)
+            this.savings = this.savings.add(investAmount);
+            this.changeBalance(investAmount.negate());
+            // small happiness bonus for investing successfully (if they had surplus)
+            this.happiness = Math.min(100, this.happiness + 2);
+        }
+
+        // 3) Discretionary consumption: small fraction of leftover
+        BigDecimal leftover = getMoney_balance().subtract(MIN_BALANCE_BUFFER);
+        if (leftover.compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal discretionary = leftover.multiply(BigDecimal.valueOf(0.1)).setScale(2, RoundingMode.FLOOR);
+            if (discretionary.compareTo(BigDecimal.ZERO) > 0) {
+                // Use discretionary to buy random non-essential goods to increase happiness
+                ProductType[] luxuries = new ProductType[] { ProductType.Soap, ProductType.Clothing, ProductType.Entertainment, ProductType.Soap };
+                ProductType pick = luxuries[ThreadLocalRandom.current().nextInt(luxuries.length)];
+                BigDecimal price = (market != null) ? market.getCheapestPrice(pick) : BigDecimal.ZERO;
+                if (price != null && price.compareTo(BigDecimal.ZERO) > 0) {
+                    BigDecimal qty = discretionary.divide(price, 0, RoundingMode.FLOOR);
+                    if (qty.compareTo(BigDecimal.ZERO) > 0) {
+                        market.placeOrder(this, pick, price, qty, true);
+                        this.changeBalance(price.multiply(qty).negate()); // assume immediate purchase for simplicity
+                        // increase happiness for luxury
+                        this.happiness = Math.min(100, this.happiness + 3);
+                    }
+                }
+            }
+        }
+
+        // Clamp happiness
+        if (this.happiness < 0) this.happiness = 0;
+        if (this.happiness > 100) this.happiness = 100;
+
+        return true;
+    }
+
     // Getter for private variable money_balance
     public BigDecimal getMoney_balance() {
         return money_balance;
@@ -268,7 +429,7 @@ public class Citizen implements Economic_Entity {
 	    if (experience == null) {
 	        return 0;
 	    }
-
+	
 	    switch (experience) {
 	        case manufacturing:
 	            return this.experience_manufacturing;
@@ -288,7 +449,7 @@ public class Citizen implements Economic_Entity {
 	        default:
 	            return 0;
 	    }
-
+	
 
 }
 }
