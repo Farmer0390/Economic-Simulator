@@ -82,6 +82,8 @@ public class Market {
      * Immediate buy: attempt to buy up to desiredAmount from existing sell orders for type,
      * paying up to maxUnitPrice per unit. Executes trades immediately (no placing buy orders).
      * Returns amount actually purchased.
+     * 
+     * FIX: Use poll() → modify → add() pattern to avoid corrupting PriorityQueue internal state
      */
     public BigDecimal immediateBuy(Economic_Entity buyer, ProductType type, BigDecimal desiredAmount, BigDecimal maxUnitPrice) {
         if (buyer == null || type == null || desiredAmount == null || desiredAmount.compareTo(BigDecimal.ZERO) <= 0) {
@@ -93,31 +95,44 @@ public class Market {
         BigDecimal remainingToBuy = desiredAmount;
         BigDecimal totalBought = BigDecimal.ZERO;
 
-        // Use a temporary list to re-add partially modified orders after iteration
-        // But PriorityQueue doesn't support iteration+modification safely; we'll poll and re-add leftovers.
-        PriorityQueue<Order> temp = new PriorityQueue<>(sellComparator);
-
         while (remainingToBuy.compareTo(BigDecimal.ZERO) > 0 && !sellQueue.isEmpty()) {
-            Order sell = sellQueue.peek();
-            if (sell.pricePerUnit.compareTo(maxUnitPrice) > 0) break; // sellers are too expensive
+            // CRITICAL FIX: Poll the order first before modifying it
+            Order sell = sellQueue.poll();
+            
+            if (sell.pricePerUnit.compareTo(maxUnitPrice) > 0) {
+                // Seller is too expensive, re-add and break
+                sellQueue.add(sell);
+                break;
+            }
 
             // check seller still has inventory
             if (!sell.issuer.hasProductInInventory(type, sell.amount)) {
-                // remove invalid order
-                sellQueue.poll();
+                // remove invalid order (already polled, don't re-add)
                 continue;
             }
 
             BigDecimal sellerAvailable = sell.amount;
             // how much buyer can afford at this price
             BigDecimal buyerFunds = buyer.getBalance();
-            if (buyerFunds.compareTo(BigDecimal.ZERO) <= 0) break;
+            if (buyerFunds.compareTo(BigDecimal.ZERO) <= 0) {
+                // Buyer has no funds, re-add order and break
+                sellQueue.add(sell);
+                break;
+            }
 
             BigDecimal affordableByFunds = buyerFunds.divide(sell.pricePerUnit, 0, java.math.RoundingMode.FLOOR);
-            if (affordableByFunds.compareTo(BigDecimal.ZERO) <= 0) break;
+            if (affordableByFunds.compareTo(BigDecimal.ZERO) <= 0) {
+                // Buyer cannot afford even 1 unit, re-add order and break
+                sellQueue.add(sell);
+                break;
+            }
 
             BigDecimal tradeAmount = sellerAvailable.min(remainingToBuy).min(affordableByFunds);
-            if (tradeAmount.compareTo(BigDecimal.ZERO) <= 0) break;
+            if (tradeAmount.compareTo(BigDecimal.ZERO) <= 0) {
+                // No viable trade amount, re-add order and break
+                sellQueue.add(sell);
+                break;
+            }
 
             BigDecimal totalCost = tradeAmount.multiply(sell.pricePerUnit);
 
@@ -133,15 +148,16 @@ public class Market {
             BigDecimal highest = getHighestPrice(type);
             sell.issuer.registerSale(type, tradeAmount, sell.pricePerUnit, highest);
 
-            // update order amounts
+            // CRITICAL FIX: Modify the order AFTER polling
             sell.amount = sell.amount.subtract(tradeAmount);
             sell.Amount_fullfilled = sell.Amount_fullfilled.add(tradeAmount);
 
             totalBought = totalBought.add(tradeAmount);
             remainingToBuy = remainingToBuy.subtract(tradeAmount);
 
-            if (sell.amount.signum() == 0) {
-                sellQueue.poll(); // remove completed order
+            // Re-add to queue only if order is not fully filled
+            if (sell.amount.compareTo(BigDecimal.ZERO) > 0) {
+                sellQueue.add(sell);
             }
         }
 
@@ -202,10 +218,14 @@ public class Market {
         return requiredAsBig;
     }
 
-    public void tick() {
-        System.out.println("\n--- [MARKT TICK] Monat " + currentGlobalTick + " wird berechnet ---");
-        
-        for (ProductType type : sellOrdersMap.keySet()) {
+    /**
+     * Matches buy orders against sell orders for immediate execution.
+     * Complexity: O(min(B, S) * log(B) + log(S)) per product type
+     * where B = buy orders, S = sell orders
+     * Overall: Linear in number of successful matches, with logarithmic queue operations
+     */
+    public void matchOrders() {
+        for (ProductType type : buyOrdersMap.keySet()) {
             PriorityQueue<Order> buyQueue = buyOrdersMap.get(type);
             PriorityQueue<Order> sellQueue = sellOrdersMap.get(type);
 
@@ -214,57 +234,84 @@ public class Market {
             }
 
             while (!buyQueue.isEmpty() && !sellQueue.isEmpty()) {
-                Order highestBuyer = buyQueue.peek();  
-                Order lowestSeller = sellQueue.peek(); 
+                Order highestBuyer = buyQueue.peek();
+                Order lowestSeller = sellQueue.peek();
 
+                // No overlap in prices -> stop matching
                 if (highestBuyer.pricePerUnit.compareTo(lowestSeller.pricePerUnit) < 0) {
-                    break; 
+                    break;
                 }
+
+                // Poll both orders before modifying
+                buyQueue.poll();
+                sellQueue.poll();
 
                 BigDecimal availableToBuy = highestBuyer.amount;
                 BigDecimal availableToSell = lowestSeller.amount;
-               
+
                 BigDecimal tradeAmount = availableToBuy.min(availableToSell);
 
-                BigDecimal finalPricePerUnit = (highestBuyer.creationTick <= lowestSeller.creationTick) 
-                                        ? highestBuyer.pricePerUnit 
-                                        : lowestSeller.pricePerUnit;
-                
+                // Determine final price (earlier order wins)
+                BigDecimal finalPricePerUnit = (highestBuyer.creationTick <= lowestSeller.creationTick)
+                        ? highestBuyer.pricePerUnit
+                        : lowestSeller.pricePerUnit;
+
                 BigDecimal totalCost = tradeAmount.multiply(finalPricePerUnit);
 
-                
+                // Validate buyer has funds
                 if (highestBuyer.issuer.getBalance().compareTo(totalCost) < 0) {
                     System.out.println("[Markt] " + highestBuyer.issuer.getName() + " hat zu wenig Geld! Order gelöscht.");
-                    buyQueue.poll(); 
+                    // Already polled, don't re-add buyer order
+                    // Re-add seller order for other buyers
+                    sellQueue.add(lowestSeller);
                     continue;
                 }
+
+                // Validate seller has inventory
                 if (!lowestSeller.issuer.hasProductInInventory(type, tradeAmount)) {
                     System.out.println("[Markt] " + lowestSeller.issuer.getName() + " hat die Ware nicht mehr! Order gelöscht.");
-                    sellQueue.poll(); 
+                    // Already polled, don't re-add seller order
+                    // Re-add buyer order for other sellers
+                    buyQueue.add(highestBuyer);
                     continue;
                 }
 
                 // --- Geld Transaktion ---
                 highestBuyer.issuer.changeBalance(totalCost.negate());
                 lowestSeller.issuer.changeBalance(totalCost);
-                //--- WarenTransaktion
+
+                // --- Waren Transaktion ---
                 lowestSeller.issuer.removeProduct(type, tradeAmount);
-                highestBuyer.issuer.addProduct(type, tradeAmount); 
+                highestBuyer.issuer.addProduct(type, tradeAmount);
 
                 // --- FEEDBACK AN KÄUFER & VERKÄUFER ---
                 BigDecimal cheapestMarketPrice = getCheapestPrice(type);
                 highestBuyer.issuer.registerBuy(type, tradeAmount, finalPricePerUnit, cheapestMarketPrice);
-                
+
                 BigDecimal highestMarketPrice = getHighestPrice(type);
                 lowestSeller.issuer.registerSale(type, tradeAmount, finalPricePerUnit, highestMarketPrice);
 
+                // CRITICAL FIX: Modify amounts AFTER polling, then re-add if necessary
                 highestBuyer.amount = highestBuyer.amount.subtract(tradeAmount);
                 lowestSeller.amount = lowestSeller.amount.subtract(tradeAmount);
 
-                if (highestBuyer.amount.signum() == 0) buyQueue.poll();
-                if (lowestSeller.amount.signum() == 0) sellQueue.poll();
+                // Re-add orders if they are partially filled
+                if (highestBuyer.amount.compareTo(BigDecimal.ZERO) > 0) {
+                    buyQueue.add(highestBuyer);
+                }
+                if (lowestSeller.amount.compareTo(BigDecimal.ZERO) > 0) {
+                    sellQueue.add(lowestSeller);
+                }
             }
         }
+    }
+
+    public void tick() {
+        System.out.println("\n--- [MARKT TICK] Monat " + currentGlobalTick + " wird berechnet ---");
+        
+        // Match buy orders against sell orders (now actually used!)
+        matchOrders();
+        
         this.currentGlobalTick++;
     }
 }
